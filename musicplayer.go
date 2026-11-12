@@ -1,10 +1,14 @@
 // Command musicplayer is a terminal front end for mpv.
 //
-// The tree on the left browses the music library; the right-hand side shows
-// the current track's metadata, the playback queue and the cover art. All
-// playback is delegated to mpv over its JSON IPC socket by the player
-// package. Selecting a directory anywhere (play or queue) expands it into its
-// playable files, in track order.
+// Usage:
+//
+//	musicplayer [music-directory]
+//
+// The tree on the left browses the music library, defaulting to ~/Music; the
+// right-hand side shows the current track's metadata, the playback queue and
+// the cover art. All playback is delegated to mpv over its JSON IPC socket by
+// the player package. Selecting a directory anywhere (play or queue) expands
+// it into its playable files, in track order.
 package main
 
 import (
@@ -30,6 +34,83 @@ import (
 // ipcTimeout bounds every synchronous IPC round trip to mpv. Generous enough
 // for a cold socket, short enough that a wedged player can't hang the UI.
 const ipcTimeout = 5 * time.Second
+
+// statusTimeout is how long a status-line message stays on screen.
+const statusTimeout = 4 * time.Second
+
+// ---------------------------------------------------------------------------
+// Startup: where the browser starts
+// ---------------------------------------------------------------------------
+
+// resolveRootDir turns the optional command-line argument into an absolute
+// directory to browse, defaulting to ~/Music. It runs before Application.Run
+// claims the terminal, so failing loudly on stderr is both visible and safe.
+func resolveRootDir(args []string) (string, error) {
+	dir, explicit := "", false
+	if len(args) > 0 {
+		dir, explicit = args[0], true
+	}
+
+	if !explicit {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot locate home directory: %w", err)
+		}
+		dir = filepath.Join(home, "Music")
+	} else {
+		dir = expandHome(dir)
+	}
+
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", dir, err)
+	}
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		if !explicit {
+			return "", fmt.Errorf("no music directory: %s does not exist (pass one on the command line)", abs)
+		}
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s: not a directory", abs)
+	}
+	return abs, nil
+}
+
+// expandHome replaces a leading "~" with the user's home directory, so
+// `musicplayer ~/Music/Albums` behaves as typed. The "~user" form is left
+// alone; os.UserHomeDir only knows about the current user.
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") && !strings.HasPrefix(path, `~\`) {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path // best effort: let the Stat in resolveRootDir report it
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
+}
+
+// ---------------------------------------------------------------------------
+// Status line: where runtime diagnostics go
+// ---------------------------------------------------------------------------
+
+// statusWriter adapts the standard logger to the status line. Once
+// Application.Run has taken over the terminal it owns stdout and stderr, so a
+// log.Printf would otherwise stamp its text on top of the drawn screen.
+type statusWriter struct{ note func(string) }
+
+func (w statusWriter) Write(p []byte) (int, error) {
+	if msg := strings.TrimRight(string(p), "\n"); msg != "" {
+		w.note(msg)
+	}
+	return len(p), nil // claim the whole write so log never reports a short one
+}
 
 // ---------------------------------------------------------------------------
 // Queue helpers
@@ -232,6 +313,17 @@ func naturalLess(a, b string) bool {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// Where the browser starts. Resolved first because a bad path is a
+	// startup error, not something to discover from an empty tree.
+	if len(os.Args) > 2 {
+		fmt.Fprintf(os.Stderr, "usage: %s [music-directory]\n", filepath.Base(os.Args[0]))
+		os.Exit(2)
+	}
+	rootDir, err := resolveRootDir(os.Args[1:])
+	if err != nil {
+		log.Fatalf("%s: %v", filepath.Base(os.Args[0]), err)
+	}
+
 	// Pause state mirror. Written by the event goroutine, read by the input
 	// handler, hence the mutex.
 	var (
@@ -250,7 +342,8 @@ func main() {
 	}
 
 	// Queue state. Guarded by queueMu because the player event loop lives on
-	// its own goroutine.
+	// its own goroutine. batchMu serialises album batches so two overlapping
+	// albums can't interleave in the playlist.
 	var (
 		queueMu      sync.Mutex
 		queueEntries []queueEntry
@@ -273,17 +366,58 @@ func main() {
 		player.Observe(int64(i+1), name)
 	}
 
-
 	// Initialize app, create root
 	app := tview.NewApplication()
 	flexRoot := tview.NewFlex().
 		SetDirection(tview.FlexColumn)
 
 	// -----------------------------------------------------------------------
+	// Status line
+	// -----------------------------------------------------------------------
+
+	statusDisplay := tview.NewTextView().
+		SetDynamicColors(false). // log text must not be parsed as colour tags
+		SetWrap(false)           // one line: long messages clip, they don't wrap
+	statusDisplay.SetTextColor(tcell.ColorOrange)
+
+	// note reports something to the user without touching the terminal's
+	// standard streams. It never blocks — QueueUpdate waits for the event loop
+	// to execute the update, so the actual hand-off happens on the forwarder
+	// goroutine, not on the caller's.
+	statusCh := make(chan string, 8)
+	note := func(msg string) {
+		select {
+		case statusCh <- msg:
+		default: // a burst of messages; the ones already queued will do
+		}
+	}
+
+	go func() {
+		tick := time.NewTicker(500 * time.Millisecond)
+		defer tick.Stop()
+
+		var expires time.Time // zero while the line is empty
+		show := func(msg string) {
+			app.QueueUpdateDraw(func() { statusDisplay.SetText(msg) })
+		}
+		for {
+			select {
+			case msg := <-statusCh:
+				expires = time.Now().Add(statusTimeout)
+				show(msg)
+			case <-tick.C:
+				if !expires.IsZero() && time.Now().After(expires) {
+					expires = time.Time{}
+					show("")
+				}
+			}
+		}
+	}()
+
+	// -----------------------------------------------------------------------
 	// Browser
 	// -----------------------------------------------------------------------
 
-	rootDir := "/home/caitlyn/Music/" // TODO: take this from the command line
 	rootNode := tview.NewTreeNode(rootDir)
 
 	browserTree := tview.NewTreeView().
@@ -416,7 +550,9 @@ func main() {
 	playAlbum := func(dir string, replace bool) {
 		files := collectAlbum(dir)
 		if len(files) == 0 {
-			log.Printf("album: no playable files under %s", dir)
+			// Worth saying out loud: nothing was queued, and — for 'p' — the
+			// current playlist was deliberately left alone.
+			note("No playable files in " + filepath.Base(dir))
 			return
 		}
 		enqueueBatch(files, replace)
@@ -566,7 +702,8 @@ func main() {
 	// We set up nesting in reverse, which is confusing
 	rightFlexBox := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(interiorFlexBox, 0, 5, false).
-		AddItem(controlDisplay, 0, 1, false)
+		AddItem(controlDisplay, 0, 1, false).
+		AddItem(statusDisplay, 1, 0, false) // fixed one row, never grows
 
 	// Main layout construction
 	flexRoot.AddItem(browserTree, 0, 1, false).
@@ -579,9 +716,10 @@ func main() {
 	imageDisplay.SetTitle(" Image ")
 	imageDisplay.SetBorder(true)
 
-	controlDisplay.SetText("WSD - Navigate Menu | TAB - Switch browser/queue | p - Play (folder = album) | o - Queue (folder = album) | x - Remove | u - Pause | n/m - Seek")
+	controlDisplay.SetText("WASD - Navigate Menu | TAB - Switch browser/queue | p - Play (folder = album) | o - Queue (folder = album) | x - Remove | u - Pause | n/m - Seek | q - Quit")
 	controlDisplay.SetBorder(true)
 	controlDisplay.SetTitle(" Keybindings ")
+	controlDisplay.SetTextAlign(tview.AlignCenter)
 
 	metadataList.SetTitle(" Metadata ")
 	metadataList.SetBorder(true)
@@ -643,7 +781,6 @@ func main() {
 				setPaused(v)
 			}
 		}
-		app.Draw()
 	}()
 
 	// -----------------------------------------------------------------------
@@ -698,7 +835,7 @@ func main() {
 			}
 
 		// Expand or collapse folder (browser only)
-		case 'd':
+		case 'd', 'a' :
 			if !focusQueue {
 				node := browserTree.GetCurrentNode()
 				if node != nil && checkIsDir(node) {
@@ -777,6 +914,12 @@ func main() {
 		}
 		return nil
 	})
+
+	// From here on the screen owns the terminal, so keep the logger off stderr.
+	// Everything logged after this point (including by the player package)
+	// surfaces on the status line instead of corrupting the frame.
+	log.SetFlags(0)
+	log.SetOutput(statusWriter{note: note})
 
 	// Run the app
 	if err := app.SetRoot(flexRoot, true).Run(); err != nil {
